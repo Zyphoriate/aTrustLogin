@@ -457,13 +457,26 @@ class ATrustLogin:
                             self.driver.delete_cookie(cookie['name'])
                             self.driver.add_cookie(cookie)
                         except Exception as e:
-                            logger.debug(f"Skipped stored cookie {cookie.get('name')}: {e}")
+                            logger.debug(
+                                f"Skipped stored cookie {cookie.get('name')} "
+                                f"(cookie domain={cookie.get('domain')}, "
+                                f"current url={self.driver.current_url}): {e}")
                     # 从local_storage中加载local storage
+                    # 键值必须作为参数传给脚本，不能拼进 JS 字符串字面量里：
+                    # 值只要含单引号、换行或反斜杠，拼出来就是非法 JS。
                     for key, value in data.local_storage.items():
-                        self.driver.execute_script(f"window.localStorage.setItem('{key}', '{value}')")
+                        try:
+                            self.driver.execute_script(
+                                "window.localStorage.setItem(arguments[0], arguments[1]);",
+                                key, value)
+                        except Exception as e:
+                            logger.debug(f"Skipped localStorage {key}: {e}")
                     logger.info("Loaded storage data")
         except FileNotFoundError:
             logger.info("未找到存储的数据")
+        except Exception as e:
+            # 存储文件损坏等情况下忽略即可，重新登录一次就好
+            logger.warning(f"读取存储的数据失败，已忽略：{e}")
 
         self.set_cli_cookie(force=False)
 
