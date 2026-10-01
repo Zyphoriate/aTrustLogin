@@ -17,13 +17,49 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+# 山东大学 aTrust 的 CAS 登录入口（可用 --portal_address 覆盖）
+DEFAULT_PORTAL_ADDRESS = (
+    "https://pass-sdu-edu-cn-s.atrust.sdu.edu.cn:81/cas/login"
+    "?service=https%3A%2F%2Fvpn.sdu.edu.cn%3A443%2Fpassport%2Fv1%2Fauth%2Fcas"
+)
+
+# --- 登录表单输入框的模糊识别规则 ---
+# placeholder / aria-label 的语义提示
+_USERNAME_PLACEHOLDER_HINTS = ("用户名", "账号", "帐号", "手机号", "邮箱")
+_USERNAME_PLACEHOLDER_HINTS_EN = ("user", "account", "login", "email", "mobile", "phone")
+_PASSWORD_PLACEHOLDER_HINTS = ("密码",)
+_PASSWORD_PLACEHOLDER_HINTS_EN = ("password", "passwd", "pwd")
+# id / name 的 token（un、pd、login_un、password 之类）
+_USERNAME_ID_TOKENS = {"un", "user", "username", "usr", "uname", "account", "loginname", "login", "email", "mobile"}
+_PASSWORD_ID_TOKENS = {"pd", "pwd", "pass", "password", "passwd", "upass", "upwd"}
+# 这些类型的 input 一律不当作账号密码框
+_SKIPPED_INPUT_TYPES = {"hidden", "checkbox", "radio", "submit", "button", "reset", "file", "image"}
+# 登录框常见的样式类名，仅作兜底加分
+_LOGIN_INPUT_CLASSES = ("login_box_input", "login-box-input", "loginboxinput")
+# 登录按钮候选选择器，按优先级排列
+_LOGIN_BUTTON_SELECTORS = (
+    "button[type='submit']",
+    "input[type='submit']",
+    "[class*='login_box_btn']",
+    "[class*='login-box-btn']",
+    "[class*='login_btn']",
+    "[class*='login-btn']",
+    "[class*='btn-login']",
+    "[class*='btn_login']",
+    "[class*='loginBtn']",
+    "[class*='submit']",
+    "#login",
+    "[id*='login']",
+    "button",
+)
+
 
 class ATrustLoginStorage(BaseModel):
     cookies: List[Dict[str, Any]]
     local_storage: Dict[str, Any]
 
 class ATrustLogin:
-    def __init__(self, portal_address, driver_path=None, browser_path=None, driver_type=None, data_dir="data", cookie_tid=None, cookie_sig=None, interactive=False, container_mode=False):
+    def __init__(self, portal_address, driver_path=None, browser_path=None, driver_type=None, data_dir="data", cookie_tid=None, cookie_sig=None, interactive=False, container_mode=False, logged_keywords=None):
         self.initialized = False
         self.container_mode = container_mode
         if not os.path.exists(data_dir):
@@ -35,7 +71,14 @@ class ATrustLogin:
         self.cookie_tid = cookie_tid
         self.cookie_sig = cookie_sig
 
-        self.must_be_logged_keywords = ['app_center', 'user_info', 'app_apply', 'device_manage']
+        # 登录成功后 URL fragment 里会出现的关键字。可通过 --logged_keywords 覆盖
+        # （逗号分隔），以适配非深信服原生门户的登录流程。
+        if isinstance(logged_keywords, str) and logged_keywords:
+            self.must_be_logged_keywords = [k.strip() for k in logged_keywords.split(",") if k.strip()]
+        elif logged_keywords:
+            self.must_be_logged_keywords = list(logged_keywords)
+        else:
+            self.must_be_logged_keywords = ['app_center', 'user_info', 'app_apply', 'device_manage']
         # self.must_not_logged_keywords = ['login', 'totpAuth', 'captcha', 'page_auth_trust_terminal', 'smsAuth']
 
         if self.container_mode:
@@ -121,38 +164,58 @@ class ATrustLogin:
         self.wait = WebDriverWait(self.driver, 10)
         logger.debug("Selenium init successfully.")
 
-    # 打开默认的portal地址并等待sangfor_main_auth_container出现
+    # 打开登录页
     def open_portal(self):
         self.driver.get(self.portal_address)
 
-        if self.driver.get_cookie("language"):
-            self.driver.delete_cookie("language")
-        if self.driver.get_cookie("lang"):
-            self.driver.delete_cookie("lang")
+        # 语言 cookie 只对深信服原生登录页有意义。CAS 页面用不上它，
+        # 且页面若已跳转到其它域，写 cookie 会抛 InvalidCookieDomainException，故整体容错。
+        try:
+            for name, value in (("language", "zh-CN"), ("lang", "zh-cn")):
+                if self.driver.get_cookie(name):
+                    self.driver.delete_cookie(name)
+                self.driver.add_cookie(
+                    {
+                        "name": name,
+                        "value": value,
+                        "domain": self.portal_host,
+                        "path": "/",
+                    }
+                )
+        except Exception as e:
+            logger.debug(f"Skipped language cookie: {e}")
 
-        self.driver.add_cookie(
-            {
-                "name": "language",
-                "value": "zh-CN",
-                "domain": self.portal_host,
-                "path": "/",
-            }
-        )
+    def wait_login_page(self, timeout=30):
+        """等待登录表单出现。既兼容深信服原生登录页，也兼容 CAS 等第三方登录页。"""
 
-        self.driver.add_cookie(
-            {
-                "name": "lang",
-                "value": "zh-cn",
-                "domain": self.portal_host,
-                "path": "/",
-            }
-        )
+        def form_ready(driver):
+            try:
+                if driver.execute_script("return document.readyState") != "complete":
+                    return False
+            except Exception:
+                return False
 
-    def wait_login_page(self):
-        # 使用显式等待sangfor_main_auth_container元素出现
-        self.wait.until(EC.presence_of_element_located((By.ID, "sangfor_main_auth_container")))
-        self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, "login-panel")))
-        self.wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+            # 深信服原生登录页
+            try:
+                if driver.find_elements(By.ID, "sangfor_main_auth_container") and \
+                        driver.find_elements(By.CLASS_NAME, "login-panel"):
+                    return True
+            except Exception:
+                pass
+
+            # CAS 等第三方登录页：只要用户名和密码框都出现即认为表单就绪
+            try:
+                username_input, password_input = self.find_login_inputs()
+                return username_input is not None and password_input is not None
+            except Exception:
+                return False
+
+        try:
+            WebDriverWait(self.driver, timeout).until(form_ready)
+            return True
+        except Exception:
+            logger.warning("等待登录表单超时，继续尝试填写")
+            return False
 
     @staticmethod
     def delay_input():
@@ -162,83 +225,190 @@ class ATrustLogin:
     def delay_loading():
         time.sleep(5)
 
-    # 递归查找具有指定placeholder的前两个非hidden类型的input框
-    def find_input_fields(self, element, inputs_found=None):
-        if inputs_found is None:
-            inputs_found = []
+    @staticmethod
+    def score_input(element):
+        """给一个 input 打分，返回 (用户名可能性, 密码可能性)，0 表示不像。"""
+        try:
+            input_type = (element.get_attribute("type") or "text").strip().lower()
+        except Exception:
+            input_type = "text"
+        if input_type in _SKIPPED_INPUT_TYPES:
+            return 0, 0
 
-        # 检查当前节点是否是符合条件的input框
-        if element.tag_name == "input":
-            placeholder = element.get_attribute("placeholder")
-            input_type = element.get_attribute("type")
-            # 确保input具有指定的placeholder，并且不是hidden类型
-            if placeholder and ("账号" in placeholder or "account" in placeholder.lower() or "密码" in placeholder or "password" in placeholder.lower()) and input_type != "hidden":
-                inputs_found.append(element)
-                # 如果找到两个符合条件的input框就返回
-                if len(inputs_found) == 2:
-                    return inputs_found
+        def attr(name):
+            try:
+                return (element.get_attribute(name) or "").strip()
+            except Exception:
+                return ""
 
-        # 递归遍历所有子节点
-        child_elements = element.find_elements(By.XPATH, "./*")
-        for child in child_elements:
-            result = self.find_input_fields(child, inputs_found)
-            if result and len(result) == 2:
-                return result
-        return inputs_found
+        element_id = attr("id").lower()
+        name = attr("name").lower()
+        classes = attr("class").lower()
+        # placeholder 缺失时退而用 aria-label / title
+        placeholder = attr("placeholder") or attr("aria-label") or attr("title")
+        placeholder_lower = placeholder.lower()
+
+        username_score = 0
+        password_score = 0
+
+        # 1) placeholder 的语义最明确，权重最高
+        if any(hint in placeholder for hint in _USERNAME_PLACEHOLDER_HINTS) or \
+                any(hint in placeholder_lower for hint in _USERNAME_PLACEHOLDER_HINTS_EN):
+            username_score += 10
+        if any(hint in placeholder for hint in _PASSWORD_PLACEHOLDER_HINTS) or \
+                any(hint in placeholder_lower for hint in _PASSWORD_PLACEHOLDER_HINTS_EN):
+            password_score += 10
+
+        # 2) type=password 是密码框的强特征
+        if input_type == "password":
+            password_score += 20
+
+        # 3) id / name 的 token 匹配，兼容 un、pd、login_un、userName 等写法
+        for token in (element_id, name):
+            if not token:
+                continue
+            parts = {token} | set(token.replace("-", "_").split("_"))
+            if parts & _USERNAME_ID_TOKENS:
+                username_score += 8
+            if parts & _PASSWORD_ID_TOKENS:
+                password_score += 8
+
+        # 4) 登录框常见的样式类名（如 login_box_input），仅作兜底加分
+        if any(cls in classes for cls in _LOGIN_INPUT_CLASSES):
+            username_score += 3
+            password_score += 3
+
+        # 5) tabindex 顺序（如用户名=1、密码=2）只作弱提示，避免误判其它表单
+        tabindex = attr("tabindex")
+        if tabindex == "1":
+            username_score += 2
+        elif tabindex == "2":
+            password_score += 2
+
+        return username_score, password_score
+
+    def find_login_inputs(self, root=None):
+        """模糊查找登录表单里的用户名和密码输入框。
+
+        不依赖固定的 id/class，而是对页面上每个 input 打分后取最优组合，
+        因此页面改版或换成 CAS 登录页时通常仍然可用。
+        返回 (用户名元素, 密码元素)，找不到的为 None。
+        """
+        root = self.driver if root is None else root
+        try:
+            candidates = root.find_elements(By.TAG_NAME, "input")
+        except Exception:
+            return None, None
+
+        scored = []
+        for index, element in enumerate(candidates):
+            username_score, password_score = self.score_input(element)
+            if username_score or password_score:
+                scored.append({
+                    "index": index,
+                    "element": element,
+                    "username": username_score,
+                    "password": password_score,
+                })
+
+        if not scored:
+            return None, None
+
+        best_username = max(scored, key=lambda item: item["username"])
+        username_input = best_username["element"] if best_username["username"] > 0 else None
+
+        # 密码框从「除用户名框以外」的元素里挑，避免两者撞到同一个 input
+        password_pool = scored
+        if username_input is not None:
+            password_pool = [item for item in scored if item["index"] != best_username["index"]]
+        best_password = max(password_pool, key=lambda item: item["password"], default=None)
+        password_input = best_password["element"] if best_password and best_password["password"] > 0 else None
+
+        if username_input is not None:
+            logger.debug(f"Matched username input: id={username_input.get_attribute('id')}, "
+                         f"score={best_username['username']}")
+        if password_input is not None:
+            logger.debug(f"Matched password input: id={password_input.get_attribute('id')}, "
+                         f"score={best_password['password']}")
+
+        return username_input, password_input
 
     # 输入用户名和密码
     def enter_credentials(self, username, password):
+        # 部分 aTrust 页面需要先切到「本地密码」标签
         try:
             element = self.driver.find_element(By.XPATH, "//div[contains(@class, 'server-name') and contains(text(), '本地密码')]")
             if element.is_displayed():
                 self.delay_input()
                 self.scroll_and_click(element)
-        except:
+        except Exception:
             pass
 
-        # 找到包含ID=sangfor_main_auth_container的div
-        main_auth_div = self.driver.find_element(By.ID, "sangfor_main_auth_container")
+        # 在整个页面上模糊查找用户名和密码框（不再限定 sangfor_main_auth_container）
+        username_input, password_input = self.find_login_inputs()
 
-        # 递归查找前两个input框
-        input_fields = self.find_input_fields(main_auth_div)
+        if username_input is None or password_input is None:
+            logger.info("未找到用户名或密码输入框")
+            return False
 
-        if len(input_fields) >= 2:
-            username_input = input_fields[0]
-            password_input = input_fields[1]
+        self.scroll_and_click(self.wait.until(EC.element_to_be_clickable(username_input)))
+        self.delay_input()
+        username_input.clear()
+        username_input.send_keys(username)
 
-            # 输入用户名和密码
-            self.scroll_and_click(self.wait.until(EC.element_to_be_clickable(username_input)))
-            self.delay_input()
-            username_input.clear()
-            username_input.send_keys(username)
+        self.scroll_and_click(self.wait.until(EC.element_to_be_clickable(password_input)))
+        self.delay_input()
+        password_input.clear()
+        password_input.send_keys(password)
 
-            self.scroll_and_click(self.wait.until(EC.element_to_be_clickable(password_input)))
-            self.delay_input()
-            password_input.clear()
-            password_input.send_keys(password)
-
-            checkbox = main_auth_div.find_element(By.XPATH, "//input[@type='checkbox']")
-            # 检查checkbox是否已经被选中
-            if not checkbox.is_selected():
+        # 「记住我」一类的复选框，不是每个登录页都有
+        try:
+            checkbox = self.driver.find_element(By.XPATH, "//input[@type='checkbox']")
+            if checkbox.is_displayed() and not checkbox.is_selected():
                 self.delay_input()
                 self.scroll_and_click(checkbox)  # 如果没有选中，就点击选中
+        except Exception:
+            pass
 
-            logger.debug("Filled username and password")
-        else:
-            logger.info("未找到用户名或密码输入框")
+        logger.debug("Filled username and password")
+        return True
 
     # 查找并点击登录按钮
     def click_login_button(self):
-        # 在div class=login-panel中寻找包含“登录”或“login”或“log in”的按钮
-        login_panel = self.driver.find_element(By.CLASS_NAME, "login-panel")
-        buttons = login_panel.find_elements(By.TAG_NAME, "button")
+        candidates = []
+        for selector in _LOGIN_BUTTON_SELECTORS:
+            try:
+                candidates.extend(self.driver.find_elements(By.CSS_SELECTOR, selector))
+            except Exception:
+                continue
 
-        for button in buttons:
-            button_text = button.text.lower()
-            if "登录" in button_text or "login" in button_text or "log in" in button_text:
-                self.scroll_and_click(button)
-                return
-        logger.info("未找到符合条件的登录按钮")
+        visible = []
+        for element in candidates:
+            try:
+                if element.is_displayed() and element.is_enabled():
+                    visible.append(element)
+            except Exception:
+                continue
+
+        if not visible:
+            logger.info("未找到符合条件的登录按钮")
+            return False
+
+        # 优先点文本/值里带「登录」或 login / sign in 的
+        for element in visible:
+            try:
+                label = f"{element.text} {element.get_attribute('value') or ''}".lower()
+            except Exception:
+                continue
+            if "登录" in label or "login" in label or "log in" in label or "sign in" in label:
+                self.scroll_and_click(element)
+                logger.debug(f"Clicked login button: {label.strip()[:40]}")
+                return True
+
+        # 退而求其次：点选择器命中的第一个可见元素
+        self.scroll_and_click(visible[0])
+        logger.debug("Fell back to the first visible login button candidate")
+        return True
 
     def load_storage(self):
         # 从pickle文件中加载存储的数据
@@ -307,7 +477,8 @@ class ATrustLogin:
             logger.info("Already logged in")
             return True
 
-        self.enter_credentials(username=username, password=password)
+        if not self.enter_credentials(username=username, password=password):
+            return None
         self.delay_input()
         self.click_login_button()
 
@@ -365,7 +536,11 @@ class ATrustLogin:
             return None
 
         url = urlparse(self.driver.current_url)
-        return any(keyword in url.fragment for keyword in self.must_be_logged_keywords)
+        logged = any(keyword in url.fragment for keyword in self.must_be_logged_keywords)
+        if not logged:
+            # 打出来方便确认登录成功后的真实 URL，据此用 --logged_keywords 调整判定
+            logger.debug(f"Not logged in yet, current url: {self.driver.current_url}")
+        return logged
 
     def close(self):
         self.driver.quit()
@@ -407,14 +582,16 @@ class ATrustLogin:
                     logger.info(f"aTrust Port {port} is not yet being listened on. Waiting for aTrust start ...")
                     ATrustLogin.delay_loading()
 
-def main(portal_address, username, password, totp_key=None, cookie_tid=None, cookie_sig=None, keepalive=200, data_dir="./data", driver_type=None, driver_path=None, browser_path=None, interactive=False, wait_atrust=True, container_mode=False):
+def main(username, password, portal_address=DEFAULT_PORTAL_ADDRESS, totp_key=None, cookie_tid=None, cookie_sig=None, keepalive=200, data_dir="./data", driver_type=None, driver_path=None, browser_path=None, interactive=False, wait_atrust=True, container_mode=False, logged_keywords=None):
     logger.info("Opening Web Browser")
 
     if wait_atrust:
         ATrustLogin.wait_for_port(54631)
 
+    logger.info(f"Portal address: {portal_address}")
+
     # 创建ATrustLogin对象
-    at = ATrustLogin(data_dir=data_dir, portal_address=portal_address, cookie_tid=cookie_tid, cookie_sig=cookie_sig, driver_type=driver_type, driver_path=driver_path, browser_path=browser_path, interactive=interactive, container_mode=container_mode)
+    at = ATrustLogin(data_dir=data_dir, portal_address=portal_address, cookie_tid=cookie_tid, cookie_sig=cookie_sig, driver_type=driver_type, driver_path=driver_path, browser_path=browser_path, interactive=interactive, container_mode=container_mode, logged_keywords=logged_keywords)
 
     at.init()
 
