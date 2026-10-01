@@ -164,26 +164,40 @@ class ATrustLogin:
         self.wait = WebDriverWait(self.driver, 10)
         logger.debug("Selenium init successfully.")
 
+    def current_cookie_domain(self):
+        """返回当前页面所在的域名，供写 cookie 使用。
+
+        cookie 的 domain 必须与当前页面域名匹配。登录页常常会跳转到 portal
+        之外的域（山大那个 CAS 入口会跳到真正的统一身份认证页面），
+        因此不能写死 portal 的域名，否则会抛 InvalidCookieDomainException。
+        """
+        try:
+            host = urlparse(self.driver.current_url).hostname
+        except Exception:
+            host = None
+        return host or self.portal_host
+
     # 打开登录页
     def open_portal(self):
         self.driver.get(self.portal_address)
 
-        # 语言 cookie 只对深信服原生登录页有意义。CAS 页面用不上它，
-        # 且页面若已跳转到其它域，写 cookie 会抛 InvalidCookieDomainException，故整体容错。
-        try:
-            for name, value in (("language", "zh-CN"), ("lang", "zh-cn")):
+        # 语言 cookie 只对深信服原生登录页有意义，CAS 页面用不上；
+        # 且页面可能已跳转到别的域，写失败不影响主流程，故逐个容错。
+        domain = self.current_cookie_domain()
+        for name, value in (("language", "zh-CN"), ("lang", "zh-cn")):
+            try:
                 if self.driver.get_cookie(name):
                     self.driver.delete_cookie(name)
                 self.driver.add_cookie(
                     {
                         "name": name,
                         "value": value,
-                        "domain": self.portal_host,
+                        "domain": domain,
                         "path": "/",
                     }
                 )
-        except Exception as e:
-            logger.debug(f"Skipped language cookie: {e}")
+            except Exception as e:
+                logger.debug(f"Skipped cookie {name}: {e}")
 
     def wait_login_page(self, timeout=30):
         """等待登录表单出现。既兼容深信服原生登录页，也兼容 CAS 等第三方登录页。"""
@@ -417,9 +431,14 @@ class ATrustLogin:
                 with open(os.path.join(self.data_dir, "ATrustLoginStorage.pkl"), "rb") as f:
                     data = pickle.load(f)
                     # 从cookies中加载cookie
+                    # 存下来的 cookie 属于当时的域，若登录页跳转到了别的域就写不进去，
+                    # 这里逐个容错，避免一个陈旧 cookie 让整个流程崩掉。
                     for cookie in data.cookies:
-                        self.driver.delete_cookie(cookie['name'])
-                        self.driver.add_cookie(cookie)
+                        try:
+                            self.driver.delete_cookie(cookie['name'])
+                            self.driver.add_cookie(cookie)
+                        except Exception as e:
+                            logger.debug(f"Skipped stored cookie {cookie.get('name')}: {e}")
                     # 从local_storage中加载local storage
                     for key, value in data.local_storage.items():
                         self.driver.execute_script(f"window.localStorage.setItem('{key}', '{value}')")
@@ -438,23 +457,30 @@ class ATrustLogin:
         return element
 
     def set_cli_cookie(self, force=False):
-        if force or not self.driver.get_cookie("tid"):
-            self.driver.delete_cookie("tid")
-            self.driver.add_cookie({
-                "name": "tid",
-                "value": self.cookie_tid,
-                "domain": self.portal_host,
-                "path": "/"
-            })
+        """写入 --cookie_tid / --cookie_sig 指定的 cookie。
 
-        if force or not self.driver.get_cookie("tid.sig"):
-            self.driver.delete_cookie("tid.sig")
-            self.driver.add_cookie({
-                "name": "tid.sig",
-                "value": self.cookie_sig,
-                "domain": self.portal_host,
-                "path": "/"
-            })
+        这两个 cookie 用于绕过深信服原生登录页的图形验证码，在 CAS 等第三方
+        登录页上通常用不到。因此：未提供时直接跳过（原先会把 None 当成 cookie
+        的值，新版 Chrome 会直接报错）；写入失败也只记日志，不中断流程。
+        """
+        if self.cookie_tid is None and self.cookie_sig is None:
+            return
+
+        domain = self.current_cookie_domain()
+        for name, value in (("tid", self.cookie_tid), ("tid.sig", self.cookie_sig)):
+            if value is None:
+                continue
+            try:
+                if force or not self.driver.get_cookie(name):
+                    self.driver.delete_cookie(name)
+                    self.driver.add_cookie({
+                        "name": name,
+                        "value": value,
+                        "domain": domain,
+                        "path": "/",
+                    })
+            except Exception as e:
+                logger.debug(f"Skipped cookie {name}: {e}")
 
     def require_interact(self):
         if self.interactive:
