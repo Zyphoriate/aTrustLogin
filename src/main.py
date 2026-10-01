@@ -36,22 +36,30 @@ _PASSWORD_ID_TOKENS = {"pd", "pwd", "pass", "password", "passwd", "upass", "upwd
 _SKIPPED_INPUT_TYPES = {"hidden", "checkbox", "radio", "submit", "button", "reset", "file", "image"}
 # 登录框常见的样式类名，仅作兜底加分
 _LOGIN_INPUT_CLASSES = ("login_box_input", "login-box-input", "loginboxinput")
-# 登录按钮候选选择器，按优先级排列
+# 登录按钮候选选择器，按优先级排列。
+# 注意：一律用 input/button/a 限定元素类型。否则像 [id*='login'] 这类写法会匹配到
+# 把整块登录区包起来的 div 容器，而容器的 .text 是内部全部文字（含「登录」），
+# 点它等于什么都没点。
 _LOGIN_BUTTON_SELECTORS = (
-    "button[type='submit']",
+    # 山大统一身份认证页
+    "input#index_login_btn",
+    "input.login_box_landing_btn",
+    # 深信服原生登录页
+    ".login-panel button",
+    ".login-panel input[type='submit']",
+    # 通用写法
     "input[type='submit']",
-    "[class*='login_box_btn']",
-    "[class*='login-box-btn']",
-    "[class*='login_btn']",
-    "[class*='login-btn']",
-    "[class*='btn-login']",
-    "[class*='btn_login']",
-    "[class*='loginBtn']",
-    "[class*='submit']",
-    "#login",
-    "[id*='login']",
-    "button",
+    "button[type='submit']",
+    "input[type='button'][class*='login']",
+    "input[class*='login_btn']",
+    "input[class*='login-btn']",
+    "button[class*='login_btn']",
+    "button[class*='login-btn']",
+    "a[class*='login_btn']",
+    "a[class*='login-btn']",
 )
+# 兜底按文本匹配时，超过这个长度的标签一律忽略——那是容器而不是按钮
+_MAX_BUTTON_LABEL_LEN = 20
 
 
 class ATrustLoginStorage(BaseModel):
@@ -387,42 +395,53 @@ class ATrustLogin:
         logger.debug("Filled username and password")
         return True
 
-    # 查找并点击登录按钮
-    def click_login_button(self):
-        candidates = []
-        for selector in _LOGIN_BUTTON_SELECTORS:
-            try:
-                candidates.extend(self.driver.find_elements(By.CSS_SELECTOR, selector))
-            except Exception:
-                continue
-
-        visible = []
-        for element in candidates:
-            try:
-                if element.is_displayed() and element.is_enabled():
-                    visible.append(element)
-            except Exception:
-                continue
-
-        if not visible:
-            logger.info("未找到符合条件的登录按钮")
+    @staticmethod
+    def is_visible_and_enabled(element):
+        try:
+            return element.is_displayed() and element.is_enabled()
+        except Exception:
             return False
 
-        # 优先点文本/值里带「登录」或 login / sign in 的
-        for element in visible:
+    # 查找并点击登录按钮
+    def click_login_button(self):
+        # 1) 按选择器逐个尝试，顺序即优先级
+        for selector in _LOGIN_BUTTON_SELECTORS:
             try:
-                label = f"{element.text} {element.get_attribute('value') or ''}".lower()
+                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
             except Exception:
                 continue
-            if "登录" in label or "login" in label or "log in" in label or "sign in" in label:
+            for element in elements:
+                if self.is_visible_and_enabled(element):
+                    self.scroll_and_click(element)
+                    logger.debug(f"Clicked login button via selector: {selector}")
+                    return True
+
+        # 2) 兜底：只在真正的交互元素里按短标签找。
+        #    限制标签长度是关键——登录区若有「账号登录 / 短信登录」之类的页签，
+        #    它们的文本也含「登录」，短标签约束可以避开；容器的长文本则直接跳过。
+        try:
+            candidates = self.driver.find_elements(
+                By.CSS_SELECTOR, "input[type='submit'], input[type='button'], button, a")
+        except Exception:
+            candidates = []
+
+        for element in candidates:
+            if not self.is_visible_and_enabled(element):
+                continue
+            try:
+                label = f"{element.text} {element.get_attribute('value') or ''}".strip()
+            except Exception:
+                continue
+            if not label or len(label) > _MAX_BUTTON_LABEL_LEN:
+                continue
+            lowered = label.lower()
+            if "登录" in label or "login" in lowered or "sign in" in lowered:
                 self.scroll_and_click(element)
-                logger.debug(f"Clicked login button: {label.strip()[:40]}")
+                logger.debug(f"Clicked login button by label: {label}")
                 return True
 
-        # 退而求其次：点选择器命中的第一个可见元素
-        self.scroll_and_click(visible[0])
-        logger.debug("Fell back to the first visible login button candidate")
-        return True
+        logger.info("未找到符合条件的登录按钮")
+        return False
 
     def load_storage(self):
         # 从pickle文件中加载存储的数据
@@ -453,7 +472,12 @@ class ATrustLogin:
 
     def scroll_and_click(self, element):
         self.driver.execute_script("arguments[0].scrollIntoView();", element)
-        element.click()
+        try:
+            element.click()
+        except Exception as e:
+            # 元素被子元素/浮层遮挡时原生 click 会失败，退回 JS click
+            logger.debug(f"Native click failed ({e}), falling back to JS click")
+            self.driver.execute_script("arguments[0].click();", element)
         return element
 
     def set_cli_cookie(self, force=False):
